@@ -35,5 +35,7 @@ build/
 .vscode/
 
 ### Infra ###
-grafana/
-prometheus/
+grafana/*
+!grafana/provisioning/
+prometheus/*
+!prometheus/prometheus.yml

@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
+import java.util.concurrent.atomic.AtomicInteger
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -21,6 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -40,15 +43,39 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
+    private val tags = arrayOf("service", serviceName, "account", accountName)
+    private val inFlight = AtomicInteger()
+    private val httpTimer = meterRegistry.timer("payment.provider.duration", *tags)
+    
+    private fun recordWait(startedAt: Long, outcome: String) {
+        meterRegistry.timer("payment.queue.wait", *tags, "outcome", outcome)
+            .record(Duration.ofMillis((now() - startedAt).coerceAtLeast(0)))
+    }
+
+    init {
+        listOf("expired_before_send", "success_on_time", "success_after_deadline",
+            "provider_failure", "provider_error_unknown").forEach {
+            meterRegistry.counter("payment.attempts", *tags, "outcome", it)
+        }
+        meterRegistry.gauge("payment.provider.inflight", io.micrometer.core.instrument.Tags.of(*tags), inFlight)
+        io.micrometer.core.instrument.Gauge.builder("payment.admission.waiters", ongoingWindow) {
+            it.awaitingQueueSize().toDouble()
+        }.tags(*tags).register(meterRegistry)
+    }
+
+    private fun count(outcome: String) = meterRegistry.counter("payment.attempts", *tags, "outcome", outcome).increment()
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
 
         var windowAcquired = false
+        var providerStarted = false
+        var providerCompleted = false
         try {
 
-            val latestStart = deadline - requestAverageProcessingTime.toMillis()
+            val latestStart = latestStart(deadline)
             val acquired = try {
                 windowAcquired = ongoingWindow.acquire(Duration.ofMillis(latestStart - now()))
                 windowAcquired && rateLimiter.tickBlocking(Duration.ofMillis(latestStart - now())) && now() < latestStart
@@ -65,6 +92,8 @@ class PaymentExternalSystemAdapterImpl(
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
             
             if (!acquired) {
+                recordWait(paymentStartedAt, "discarded")
+                count("expired_before_send")
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Outdated payment")
                 }
@@ -77,29 +106,47 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             if (now() >= latestStart) {
+                recordWait(paymentStartedAt, "discarded")
+                count("expired_before_send")
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "There is no time for payment")
                 }
                 return
             }
 
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+            providerStarted = true
+            recordWait(paymentStartedAt, "sent")
+            val httpStarted = System.nanoTime()
+            inFlight.incrementAndGet()
+            val body = try {
+                client.newCall(request).execute().use { response ->
+                    // Consume the body once; malformed responses still release the slot.
+                    val rawBody = response.body?.string()
+                    try {
+                        mapper.readValue(rawBody, ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false,
+                            "Invalid provider response (HTTP ${response.code})")
+                    }
                 }
+            } finally {
+                httpTimer.record(System.nanoTime() - httpStarted, java.util.concurrent.TimeUnit.NANOSECONDS)
+                inFlight.decrementAndGet()
+            }
+            providerCompleted = true
+            val processedAt = now()
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
+            // The response has been fully consumed. Persistence must not occupy provider capacity. so we can release the window now.
+            ongoingWindow.release()
+            windowAcquired = false
+            count(if (body.result) {
+                if (processedAt > deadline) "success_after_deadline" else "success_on_time"
+            } else "provider_failure")
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, processedAt, transactionId, reason = body.message)
             }
         } catch (e: Exception) {
+            if (providerStarted && !providerCompleted) count("provider_error_unknown")
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
@@ -120,6 +167,10 @@ class PaymentExternalSystemAdapterImpl(
             if (windowAcquired) ongoingWindow.release()
         }
     }
+
+    override fun parallelCapacity() = parallelRequests
+
+    override fun latestStart(deadline: Long) = deadline - requestAverageProcessingTime.toMillis()
 
     override fun price() = properties.price
 
