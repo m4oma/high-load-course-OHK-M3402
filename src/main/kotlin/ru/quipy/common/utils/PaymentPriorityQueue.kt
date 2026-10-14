@@ -6,26 +6,25 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-class PaymentTask(val amount: Int, val createdAt: Long, val deadline: Long, val sequence: Long,
+class PaymentTask(val amount: Int, val latestStart: Long, val sequence: Long,
                   private val action: () -> Unit) : Runnable {
     override fun run() = action()
 }
 
 class PaymentPriorityQueue(
     private val capacity: Int,
-    private val freshnessMillis: Long = 10_000,
     private val clock: () -> Long = System::currentTimeMillis,
 ) : AbstractQueue<Runnable>(), BlockingQueue<Runnable> {
     private val lock = ReentrantLock()
     private val available = lock.newCondition()
     private val space = lock.newCondition()
     private val tasks = ArrayList<PaymentTask>()
-    init { require(capacity > 0); require(freshnessMillis > 0) }
+    init { require(capacity > 0) }
 
     private fun best(): PaymentTask? {
         val now = clock()
-        val fresh = tasks.filter { now - it.createdAt < freshnessMillis && it.deadline > now }
-        return fresh.maxWithOrNull(compareBy<PaymentTask> { it.amount }.thenBy { it.sequence })
+        val eligible = tasks.filter { now < it.latestStart }
+        return eligible.maxWithOrNull(compareBy<PaymentTask> { it.amount }.thenBy { it.sequence })
             ?: tasks.maxByOrNull { it.sequence }
     }
 
