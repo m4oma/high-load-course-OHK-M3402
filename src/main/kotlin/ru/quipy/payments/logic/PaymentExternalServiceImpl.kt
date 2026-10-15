@@ -77,9 +77,10 @@ class PaymentExternalSystemAdapterImpl(
 
             val latestStart = latestStart(deadline)
             val acquired = try {
-                windowAcquired = ongoingWindow.acquire(Duration.ofMillis(latestStart - now()))
-                windowAcquired && rateLimiter.tickBlocking(Duration.ofMillis(latestStart - now())) && now() < latestStart
-            } catch (e: InterruptedException) {
+                val rateAcquired = rateLimiter.tickBlocking(Duration.ofMillis(latestStart - now()))
+                windowAcquired = rateAcquired && ongoingWindow.acquire(Duration.ofMillis(latestStart - now()))
+                windowAcquired && now() < latestStart
+                } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 false
             }
